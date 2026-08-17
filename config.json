@@ -1,0 +1,17 @@
+{
+  "target": "https://test.example.com",
+  "port": 3001,
+  "record": {
+    "include": [
+      "/api/**"
+    ],
+    "exclude": [
+      "/api/health",
+      "/api/metrics"
+    ],
+    "contentTypes": [
+      "application/json",
+      "application/problem+json"
+    ]
+  }
+}

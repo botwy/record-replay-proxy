@@ -1,0 +1,26 @@
+{
+  "name": "record-replay-proxy",
+  "version": "0.1.0",
+  "description": "REST and WebSocket record/replay proxy for manual frontend testing",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types proxy.ts replay",
+    "record": "node --experimental-strip-types proxy.ts record",
+    "replay": "node --experimental-strip-types proxy.ts replay",
+    "ws:list": "node --experimental-strip-types proxy.ts ws:list",
+    "ws:send": "node --experimental-strip-types proxy.ts ws:send"
+  },
+  "dependencies": {
+    "http-proxy": "^1.18.1",
+    "picomatch": "^4.0.2",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/http-proxy": "^1.17.16",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1"
+  }
+}
