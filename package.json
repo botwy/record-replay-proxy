@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "http-proxy": "^1.18.1",
+    "http-proxy-middleware": "^4.2.0",
     "picomatch": "^4.0.2",
     "typescript": "^7.0.2",
     "ws": "^8.18.3"
