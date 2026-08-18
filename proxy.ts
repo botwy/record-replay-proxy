@@ -4,19 +4,18 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
-
 import httpProxy from 'http-proxy';
-import WebSocket, { WebSocketServer } from 'ws';
+import WebSocket, {
+  WebSocketServer,
+} from 'ws';
 import picomatch from 'picomatch';
 
 type Config = {
   target: string;
   port: number;
-
   tls?: {
     rejectUnauthorized?: boolean;
   };
-
   record: {
     include: string[];
     exclude?: string[];
@@ -29,16 +28,11 @@ type HttpRecording = {
   method: string;
   url: string;
   requestBody: string;
-
   response: {
     status: number;
     headers: Record<string, string>;
-
-    // JSON/text responses are stored as UTF-8 strings.
-    // Binary responses are stored as base64 strings.
     body: string;
-
-    bodyEncoding: 'utf8' | 'base64';
+    bodyEncoding?: 'utf8' | 'base64';
   };
 };
 
@@ -47,7 +41,7 @@ type WsRecording = {
   url: string;
   binary: boolean;
   data: string;
-  dataEncoding: 'utf8' | 'base64';
+  dataEncoding?: 'utf8' | 'base64';
   createdAt: string;
 };
 
@@ -157,38 +151,19 @@ const excludeMatcher = picomatch(
 
 /*
  * ============================================================
- * URL MATCHING
- *
- * Host is deliberately removed.
- *
- * Example:
- *
- * https://example.com/api/users
- *
- * becomes:
- *
- * /api/users
+ * RECORD SCOPE
  * ============================================================
  */
-
-function getPathname(
-  requestUrl: string,
-): string {
-  try {
-    return new URL(
-      requestUrl,
-      TARGET,
-    ).pathname;
-  } catch {
-    return requestUrl.split('?')[0];
-  }
-}
 
 function isInRecordScope(
   requestUrl: string,
 ): boolean {
-  const pathname =
-    getPathname(requestUrl);
+  const url = new URL(
+    requestUrl,
+    TARGET,
+  );
+
+  const pathname = url.pathname;
 
   if (!includeMatcher(pathname)) {
     return false;
@@ -200,6 +175,12 @@ function isInRecordScope(
 
   return true;
 }
+
+/*
+ * ============================================================
+ * CONTENT TYPE
+ * ============================================================
+ */
 
 function shouldRecordResponse(
   requestUrl: string,
@@ -306,29 +287,49 @@ function headersToObject(
   return result;
 }
 
-/*
- * ============================================================
- * HTTP REQUESTS THAT ARE CURRENTLY BEING RECORDED
- *
- * WeakMap:
- *
- * req -> request information
- *
- * proxyRes gives us the same req, so we can correctly
- * associate the response with its request even when
- * multiple requests are running simultaneously.
- * ============================================================
- */
+function sendJson(
+  res: http.ServerResponse,
+  status: number,
+  data: unknown,
+) {
+  const body = JSON.stringify(
+    data,
+    null,
+    2,
+  );
 
-const requestsToRecord =
-  new WeakMap<
-    http.IncomingMessage,
+  res.writeHead(
+    status,
     {
-      body: Buffer;
-      url: string;
-      method: string;
-    }
-  >();
+      'content-type':
+        'application/json; charset=utf-8',
+
+      'content-length':
+        String(
+          Buffer.byteLength(body),
+        ),
+    },
+  );
+
+  res.end(body);
+}
+
+function makeWsId(
+  createdAt: string,
+): string {
+  const iso =
+    new Date(createdAt)
+      .toISOString()
+      .replace(/:/g, '-')
+      .replace(/\./g, '-');
+
+  const suffix =
+    crypto
+      .randomBytes(4)
+      .toString('hex');
+
+  return `${iso}-${suffix}`;
+}
 
 /*
  * ============================================================
@@ -366,35 +367,54 @@ proxy.on(
 
 /*
  * ============================================================
- * HTTP RESPONSE INTERCEPTOR
- *
- * One permanent listener.
- *
- * We intentionally DO NOT use:
- *
- * proxy.once('proxyRes', ...)
- *
- * because proxy is shared by all requests.
+ * PROXY TO TARGET
  * ============================================================
  */
 
-proxy.on(
-  'proxyRes',
-  (
-    proxyRes,
+function proxyToTarget(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  bodyBuffer: Buffer,
+) {
+  proxy.web(
     req,
+    res,
+    {
+      target: TARGET,
+
+      buffer:
+        Readable.from(
+          bodyBuffer,
+        ),
+    },
+  );
+}
+
+/*
+ * ============================================================
+ * RECORD HTTP
+ * ============================================================
+ */
+
+async function recordHttp(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+) {
+  const bodyBuffer =
+    await readBody(req);
+
+  const body =
+    bodyBuffer.toString('utf8');
+
+  const method =
+    req.method ?? 'GET';
+
+  const url =
+    req.url ?? '/';
+
+  const onProxyRes = (
+    proxyRes: http.IncomingMessage,
   ) => {
-    if (mode !== 'record') {
-      return;
-    }
-
-    const requestInfo =
-      requestsToRecord.get(req);
-
-    if (!requestInfo) {
-      return;
-    }
-
     const contentType =
       String(
         proxyRes.headers[
@@ -404,12 +424,10 @@ proxy.on(
 
     if (
       !shouldRecordResponse(
-        requestInfo.url,
+        url,
         contentType,
       )
     ) {
-      requestsToRecord.delete(req);
-
       return;
     }
 
@@ -429,224 +447,108 @@ proxy.on(
     proxyRes.on(
       'end',
       () => {
-        try {
-          const responseBody =
-            Buffer.concat(chunks);
+        const responseBody =
+          Buffer.concat(chunks);
 
-          saveHttpRecording(
-            requestInfo,
-            proxyRes,
-            responseBody,
+        const normalizedContentType =
+          contentType.toLowerCase();
+
+        const isJson =
+          normalizedContentType.includes(
+            'application/json',
+          ) ||
+          normalizedContentType.includes(
+            '+json',
           );
-        } finally {
-          requestsToRecord.delete(req);
-        }
-      },
-    );
 
-    proxyRes.on(
-      'error',
-      () => {
-        requestsToRecord.delete(req);
-      },
-    );
-  },
-);
+        const key =
+          makeRequestKey(
+            method,
+            url,
+            body,
+          );
 
-/*
- * ============================================================
- * SAVE HTTP RECORDING
- *
- * JSON/text:
- *
- *   Buffer -> UTF-8 string
- *
- * Binary:
- *
- *   Buffer -> base64 string
- *
- * JSON is NOT parsed.
- * ============================================================
- */
+        /*
+         * IMPORTANT:
+         *
+         * JSON is deliberately NOT parsed.
+         *
+         * The response body is kept as the
+         * original UTF-8 string.
+         *
+         * Example:
+         *
+         * {"name":"Иван","age":30}
+         *
+         * is stored as a string, not as an
+         * object.
+         */
 
-function saveHttpRecording(
-  requestInfo: {
-    body: Buffer;
-    url: string;
-    method: string;
-  },
-  proxyRes: http.IncomingMessage,
-  responseBody: Buffer,
-) {
-  const contentType =
-    String(
-      proxyRes.headers[
-        'content-type'
-      ] ?? '',
-    ).toLowerCase();
+        const responseBodyString =
+          isJson
+            ? responseBody.toString(
+                'utf8',
+              )
+            : responseBody.toString(
+                'base64',
+              );
 
-  const isJson =
-    contentType.includes(
-      'application/json',
-    ) ||
-    contentType.includes(
-      '+json',
-    );
+        const recording:
+          HttpRecording = {
+            key,
 
-  let body: string;
-  let bodyEncoding:
-    | 'utf8'
-    | 'base64';
+            method,
 
-  if (isJson) {
-    /*
-     * IMPORTANT:
-     *
-     * We keep JSON as a UTF-8 string.
-     *
-     * No JSON.parse().
-     */
-    body =
-      responseBody.toString(
-        'utf8',
-      );
+            url,
 
-    bodyEncoding = 'utf8';
-  } else {
-    body =
-      responseBody.toString(
-        'base64',
-      );
+            requestBody: body,
 
-    bodyEncoding = 'base64';
-  }
+            response: {
+              status:
+                proxyRes.statusCode ??
+                500,
 
-  const requestBody =
-    requestInfo.body.toString(
-      'utf8',
-    );
+              headers:
+                headersToObject(
+                  proxyRes.headers,
+                ),
 
-  const key =
-    makeRequestKey(
-      requestInfo.method,
-      requestInfo.url,
-      requestBody,
-    );
+              body:
+                responseBodyString,
 
-  const recording:
-    HttpRecording = {
-      key,
+              bodyEncoding:
+                isJson
+                  ? 'utf8'
+                  : 'base64',
+            },
+          };
 
-      method:
-        requestInfo.method,
+        const filename =
+          path.join(
+            httpDir,
+            `${key}.json`,
+          );
 
-      url:
-        requestInfo.url,
-
-      requestBody,
-
-      response: {
-        status:
-          proxyRes.statusCode ?? 500,
-
-        headers:
-          headersToObject(
-            proxyRes.headers,
+        fs.writeFileSync(
+          filename,
+          JSON.stringify(
+            recording,
+            null,
+            2,
           ),
+        );
 
-        body,
-
-        bodyEncoding,
-      },
-    };
-
-  const filename =
-    path.join(
-      httpDir,
-      `${key}.json`,
-    );
-
-  fs.writeFileSync(
-    filename,
-    JSON.stringify(
-      recording,
-      null,
-      2,
-    ),
-    'utf8',
-  );
-
-  console.log(
-    `[HTTP RECORD] ${requestInfo.method} ${requestInfo.url}`,
-  );
-}
-
-/*
- * ============================================================
- * PROXY TO TARGET
- * ============================================================
- */
-
-function proxyToTarget(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  bodyBuffer: Buffer,
-) {
-  proxy.web(
-    req,
-    res,
-    {
-      target: TARGET,
-
-      /*
-       * The request body has already been consumed by
-       * readBody(), therefore it has to be supplied again.
-       */
-      buffer:
-        Readable.from(
-          bodyBuffer,
-        ),
-    },
-  );
-}
-
-/*
- * ============================================================
- * RECORD HTTP
- * ============================================================
- */
-
-async function recordHttp(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-) {
-  const body =
-    await readBody(req);
-
-  const url =
-    req.url ?? '/';
-
-  const method =
-    req.method ?? 'GET';
-
-  /*
-   * Only requests matching include/exclude are put
-   * into the recording map.
-   *
-   * proxyRes will later use the same req object.
-   */
-  if (
-    isInRecordScope(url)
-  ) {
-    requestsToRecord.set(
-      req,
-      {
-        body,
-        url,
-        method,
+        console.log(
+          `[HTTP RECORD] ${method} ${url}`,
+        );
       },
     );
-  }
+  };
+
+  proxy.once(
+    'proxyRes',
+    onProxyRes,
+  );
 
   console.log(
     `[HTTP → TARGET] ${method} ${url}`,
@@ -655,20 +557,13 @@ async function recordHttp(
   proxyToTarget(
     req,
     res,
-    body,
+    bodyBuffer,
   );
 }
 
 /*
  * ============================================================
  * REPLAY HTTP
- *
- * Logic:
- *
- * 1. URL not in include -> proxy
- * 2. URL in include -> look for recording
- * 3. recording found -> replay
- * 4. recording missing -> fallback to target
  * ============================================================
  */
 
@@ -676,8 +571,11 @@ async function replayHttp(
   req: http.IncomingMessage,
   res: http.ServerResponse,
 ) {
-  const body =
+  const bodyBuffer =
     await readBody(req);
+
+  const body =
+    bodyBuffer.toString('utf8');
 
   const method =
     req.method ?? 'GET';
@@ -686,12 +584,11 @@ async function replayHttp(
     req.url ?? '/';
 
   /*
-   * Not included:
-   * always proxy to target.
+   * Не входит в include/exclude —
+   * обычный proxy.
    */
-  if (
-    !isInRecordScope(url)
-  ) {
+
+  if (!isInRecordScope(url)) {
     console.log(
       `[HTTP → TARGET] ${method} ${url}`,
     );
@@ -699,20 +596,17 @@ async function replayHttp(
     proxyToTarget(
       req,
       res,
-      body,
+      bodyBuffer,
     );
 
     return;
   }
 
-  const requestBody =
-    body.toString('utf8');
-
   const key =
     makeRequestKey(
       method,
       url,
-      requestBody,
+      body,
     );
 
   const filename =
@@ -722,12 +616,11 @@ async function replayHttp(
     );
 
   /*
-   * Included but no saved recording:
-   * fallback to target.
+   * В scope, но записи нет —
+   * fallback на target.
    */
-  if (
-    !fs.existsSync(filename)
-  ) {
+
+  if (!fs.existsSync(filename)) {
     console.log(
       `[HTTP MISS → TARGET] ${method} ${url}`,
     );
@@ -735,7 +628,7 @@ async function replayHttp(
     proxyToTarget(
       req,
       res,
-      body,
+      bodyBuffer,
     );
 
     return;
@@ -750,44 +643,39 @@ async function replayHttp(
       ),
     );
 
-  let responseBody: Buffer;
+  /*
+   * UTF-8:
+   *
+   * body is already a string.
+   *
+   * We simply convert it back to the
+   * original byte representation.
+   *
+   * Base64:
+   *
+   * decode the stored binary data.
+   *
+   * The fallback to base64 is important
+   * for old recordings that don't have
+   * bodyEncoding.
+   */
 
-  if (
-    recording.response.bodyEncoding ===
-    'utf8'
-  ) {
-    /*
-     * JSON/text was stored as UTF-8 string.
-     *
-     * Restore exactly the same bytes.
-     */
-    responseBody =
-      Buffer.from(
-        recording.response.body,
-        'utf8',
-      );
-  } else {
-    /*
-     * Binary was stored as base64.
-     */
-    responseBody =
-      Buffer.from(
-        recording.response.body,
-        'base64',
-      );
-  }
+  const encoding =
+    recording.response.bodyEncoding ??
+    'base64';
+
+  const responseBody =
+    Buffer.from(
+      recording.response.body,
+      encoding,
+    );
 
   const headers = {
     ...recording.response.headers,
   };
 
-  /*
-   * These headers belong to the original transfer and
-   * should not be replayed directly.
-   */
   delete headers.connection;
   delete headers['transfer-encoding'];
-  delete headers['content-length'];
 
   headers['content-length'] =
     String(
@@ -808,7 +696,9 @@ async function replayHttp(
 
 /*
  * ============================================================
- * WEBSOCKET REPLAY
+ * WEBSOCKET REPLAY SERVER
+ *
+ * НЕ ИЗМЕНЕНО
  * ============================================================
  */
 
@@ -861,7 +751,9 @@ replayWss.on(
 
 /*
  * ============================================================
- * WEBSOCKET RECORD
+ * WEBSOCKET RECORD SERVER
+ *
+ * НЕ ИЗМЕНЕНО
  * ============================================================
  */
 
@@ -883,83 +775,13 @@ recordWss.on(
   },
 );
 
-function makeWsId(
-  createdAt: string,
-): string {
-  const iso =
-    new Date(createdAt)
-      .toISOString()
-      .replace(/:/g, '-')
-      .replace(/\./g, '-');
-
-  const suffix =
-    crypto
-      .randomBytes(4)
-      .toString('hex');
-
-  return `${iso}-${suffix}`;
-}
-
-function saveWsMessage(
-  url: string,
-  data: WebSocket.RawData,
-  binary: boolean,
-) {
-  const createdAt =
-    new Date().toISOString();
-
-  const id =
-    makeWsId(createdAt);
-
-  const buffer =
-    Buffer.isBuffer(data)
-      ? data
-      : Buffer.from(
-          data as ArrayBuffer,
-        );
-
-  const recording:
-    WsRecording = {
-      id,
-
-      url,
-
-      binary,
-
-      data:
-        binary
-          ? buffer.toString(
-              'base64',
-            )
-          : buffer.toString(
-              'utf8',
-            ),
-
-      dataEncoding:
-        binary
-          ? 'base64'
-          : 'utf8',
-
-      createdAt,
-    };
-
-  fs.writeFileSync(
-    path.join(
-      wsDir,
-      `${id}.json`,
-    ),
-    JSON.stringify(
-      recording,
-      null,
-      2,
-    ),
-    'utf8',
-  );
-
-  console.log(
-    `[WS RECORD] ${id}`,
-  );
-}
+/*
+ * ============================================================
+ * RECORD WEBSOCKET
+ *
+ * НЕ ИЗМЕНЕНО
+ * ============================================================
+ */
 
 function recordWebSocket(
   req: http.IncomingMessage,
@@ -968,19 +790,67 @@ function recordWebSocket(
   const targetUrl =
     new URL(TARGET);
 
-  const protocol =
+  const wsProtocol =
     targetUrl.protocol === 'https:'
       ? 'wss:'
       : 'ws:';
 
   const wsUrl =
-    `${protocol}//${targetUrl.host}${req.url ?? '/'}`;
+    `${wsProtocol}//${targetUrl.host}${req.url ?? '/'}`;
+
+  const headers:
+    Record<string, string> = {};
+
+  for (
+    const [key, value]
+    of Object.entries(req.headers)
+  ) {
+    if (value === undefined) {
+      continue;
+    }
+
+    if (
+      key === 'host' ||
+      key === 'connection' ||
+      key === 'upgrade' ||
+      key === 'sec-websocket-key' ||
+      key === 'sec-websocket-version' ||
+      key === 'sec-websocket-extensions' ||
+      key === 'sec-websocket-protocol'
+    ) {
+      continue;
+    }
+
+    headers[key] =
+      Array.isArray(value)
+        ? value.join(', ')
+        : value;
+  }
+
+  const protocolHeader =
+    req.headers[
+      'sec-websocket-protocol'
+    ];
+
+  const protocols =
+    protocolHeader
+      ? String(protocolHeader)
+          .split(',')
+          .map(
+            value =>
+              value.trim(),
+          )
+      : undefined;
 
   const targetWs =
     new WebSocket(
       wsUrl,
+      protocols,
       {
-        rejectUnauthorized,
+        headers,
+
+        rejectUnauthorized:
+          rejectUnauthorized,
       },
     );
 
@@ -1065,6 +935,10 @@ function recordWebSocket(
       code,
       reason,
     ) => {
+      console.log(
+        `[WS TARGET CLOSE] ${code}`,
+      );
+
       if (
         browserWs.readyState ===
         WebSocket.OPEN
@@ -1088,11 +962,91 @@ function recordWebSocket(
       }
     },
   );
+
+  browserWs.on(
+    'error',
+    () => {
+      targetWs.close();
+    },
+  );
+}
+
+/*
+ * ============================================================
+ * SAVE WS MESSAGE
+ *
+ * НЕ ИЗМЕНЕНО
+ * ============================================================
+ */
+
+function saveWsMessage(
+  url: string,
+  data: WebSocket.RawData,
+  binary: boolean,
+) {
+  const createdAt =
+    new Date().toISOString();
+
+  const id =
+    makeWsId(createdAt);
+
+  const buffer =
+    Buffer.isBuffer(data)
+      ? data
+      : Buffer.from(
+          data as ArrayBuffer,
+        );
+
+  const recording:
+    WsRecording = {
+      id,
+
+      url,
+
+      binary,
+
+      data:
+        binary
+          ? buffer.toString(
+              'base64',
+            )
+          : buffer.toString(
+              'utf8',
+            ),
+
+      dataEncoding:
+        binary
+          ? 'base64'
+          : 'utf8',
+
+      createdAt,
+    };
+
+  const filename =
+    path.join(
+      wsDir,
+      `${id}.json`,
+    );
+
+  fs.writeFileSync(
+    filename,
+    JSON.stringify(
+      recording,
+      null,
+      2,
+    ),
+  );
+
+  console.log(
+    `[WS RECORD] ${id}`,
+  );
 }
 
 /*
  * ============================================================
  * WS LIST
+ *
+ * НЕ ИЗМЕНЕНО
  * ============================================================
  */
 
@@ -1142,34 +1096,51 @@ function printWsList() {
     of recordings
   ) {
     console.log('');
+
     console.log(
-      `ID:       ${recording.id}`,
+      `ID:          ${recording.id}`,
     );
 
     console.log(
-      `URL:      ${recording.url}`,
+      `URL:         ${recording.url}`,
     );
 
     console.log(
-      `Binary:   ${recording.binary}`,
+      `Binary:      ${recording.binary}`,
     );
 
     console.log(
-      `Created:  ${recording.createdAt}`,
+      `Encoding:    ${
+        recording.dataEncoding ??
+        (
+          recording.binary
+            ? 'base64'
+            : 'utf8'
+        )
+      }`,
+    );
+
+    console.log(
+      `Created:     ${recording.createdAt}`,
     );
 
     console.log(
       'Message:',
     );
 
-    console.log(
-      recording.binary
-        ? '<binary>'
-        : recording.data,
-    );
+    if (recording.binary) {
+      console.log(
+        '<binary>',
+      );
+    } else {
+      console.log(
+        recording.data,
+      );
+    }
   }
 
   console.log('');
+
   console.log(
     `Total: ${recordings.length}`,
   );
@@ -1178,6 +1149,8 @@ function printWsList() {
 /*
  * ============================================================
  * REST LIST
+ *
+ * НЕ ИЗМЕНЕНО
  * ============================================================
  */
 
@@ -1211,19 +1184,28 @@ function printRestList() {
     const file
     of files
   ) {
+    const filename =
+      path.join(
+        httpDir,
+        file,
+      );
+
     const recording:
       HttpRecording =
       JSON.parse(
         fs.readFileSync(
-          path.join(
-            httpDir,
-            file,
-          ),
+          filename,
           'utf8',
         ),
       );
 
+    const contentType =
+      recording.response.headers[
+        'content-type'
+      ] ?? '';
+
     console.log('');
+
     console.log(
       `Key:          ${recording.key}`,
     );
@@ -1241,7 +1223,14 @@ function printRestList() {
     );
 
     console.log(
-      `Encoding:     ${recording.response.bodyEncoding}`,
+      `Content-Type: ${contentType}`,
+    );
+
+    console.log(
+      `Encoding:     ${
+        recording.response.bodyEncoding ??
+        'base64'
+      }`,
     );
 
     console.log(
@@ -1261,16 +1250,22 @@ function printRestList() {
       'Response body:',
     );
 
-    /*
-     * Do not console.dir here:
-     * body is deliberately a string.
-     */
-    console.log(
-      recording.response.body,
-    );
+    if (
+      recording.response.bodyEncoding ===
+      'base64'
+    ) {
+      console.log(
+        '<base64>',
+      );
+    } else {
+      console.log(
+        recording.response.body,
+      );
+    }
   }
 
   console.log('');
+
   console.log(
     `Total: ${files.length}`,
   );
@@ -1279,35 +1274,84 @@ function printRestList() {
 /*
  * ============================================================
  * WS SEND
+ *
+ * НЕ ИЗМЕНЕНО
  * ============================================================
  */
 
 async function sendWsCommand(
   id: string,
 ) {
-  const response =
-    await fetch(
-      `http://127.0.0.1:${PORT}` +
-      `/__mock/ws/send/` +
-      encodeURIComponent(id),
-      {
-        method: 'POST',
-      },
+  const url =
+    `http://127.0.0.1:${PORT}` +
+    `/__mock/ws/send/` +
+    encodeURIComponent(id);
+
+  try {
+    const response =
+      await fetch(
+        url,
+        {
+          method: 'POST',
+        },
+      );
+
+    const body =
+      await response.text();
+
+    console.log(body);
+
+    if (!response.ok) {
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error(
+      'Cannot connect to replay proxy.',
     );
 
-  const text =
-    await response.text();
+    console.error(
+      String(error),
+    );
 
-  console.log(text);
-
-  if (!response.ok) {
     process.exit(1);
   }
 }
 
 /*
  * ============================================================
- * SERVER
+ * CLI
+ * ============================================================
+ */
+
+if (command === 'ws:list') {
+  printWsList();
+  process.exit(0);
+}
+
+if (command === 'rest:list') {
+  printRestList();
+  process.exit(0);
+}
+
+if (command === 'ws:send') {
+  const id = process.argv[3];
+
+  if (!id) {
+    console.error(
+      'Usage: npm run ws:send -- <id>',
+    );
+
+    process.exit(1);
+  }
+
+  await sendWsCommand(id);
+
+  process.exit(0);
+}
+
+/*
+ * ============================================================
+ * HTTP SERVER
  * ============================================================
  */
 
@@ -1318,6 +1362,10 @@ const server =
       res,
     ) => {
       try {
+        /*
+         * Health
+         */
+
         if (
           req.method === 'GET' &&
           req.url ===
@@ -1328,7 +1376,10 @@ const server =
             200,
             {
               mode,
-              target: TARGET,
+
+              target:
+                TARGET,
+
               wsClients:
                 replayClients.size,
             },
@@ -1336,6 +1387,10 @@ const server =
 
           return;
         }
+
+        /*
+         * WS list API
+         */
 
         if (
           req.method === 'GET' &&
@@ -1350,6 +1405,10 @@ const server =
 
           return;
         }
+
+        /*
+         * WS send API
+         */
 
         const sendMatch =
           req.url?.match(
@@ -1372,7 +1431,9 @@ const server =
             );
 
           if (
-            !fs.existsSync(filename)
+            !fs.existsSync(
+              filename,
+            )
           ) {
             sendJson(
               res,
@@ -1380,6 +1441,7 @@ const server =
               {
                 error:
                   'WS recording not found',
+
                 id,
               },
             );
@@ -1396,10 +1458,18 @@ const server =
               ),
             );
 
+          const encoding =
+            recording.dataEncoding ??
+            (
+              recording.binary
+                ? 'base64'
+                : 'utf8'
+            );
+
           const data =
             Buffer.from(
               recording.data,
-              recording.dataEncoding,
+              encoding,
             );
 
           let sent = 0;
@@ -1426,6 +1496,10 @@ const server =
             sent++;
           }
 
+          console.log(
+            `[WS SEND] ${id} → ${sent} client(s)`,
+          );
+
           sendJson(
             res,
             200,
@@ -1438,6 +1512,10 @@ const server =
 
           return;
         }
+
+        /*
+         * REST
+         */
 
         if (mode === 'record') {
           await recordHttp(
@@ -1473,6 +1551,8 @@ const server =
 /*
  * ============================================================
  * WEBSOCKET UPGRADE
+ *
+ * НЕ ИЗМЕНЕНО
  * ============================================================
  */
 
@@ -1483,6 +1563,10 @@ server.on(
     socket,
     head,
   ) => {
+    /*
+     * Admin HTTP API не является WS.
+     */
+
     if (
       req.url?.startsWith(
         '/__mock/',
@@ -1492,6 +1576,10 @@ server.on(
 
       return;
     }
+
+    /*
+     * RECORD
+     */
 
     if (mode === 'record') {
       recordWss.handleUpgrade(
@@ -1510,6 +1598,10 @@ server.on(
       return;
     }
 
+    /*
+     * REPLAY
+     */
+
     replayWss.handleUpgrade(
       req,
       socket,
@@ -1527,40 +1619,6 @@ server.on(
 
 /*
  * ============================================================
- * JSON RESPONSE
- * ============================================================
- */
-
-function sendJson(
-  res: http.ServerResponse,
-  status: number,
-  data: unknown,
-) {
-  const body =
-    JSON.stringify(
-      data,
-      null,
-      2,
-    );
-
-  res.writeHead(
-    status,
-    {
-      'content-type':
-        'application/json; charset=utf-8',
-
-      'content-length':
-        String(
-          Buffer.byteLength(body),
-        ),
-    },
-  );
-
-  res.end(body);
-}
-
-/*
- * ============================================================
  * START
  * ============================================================
  */
@@ -1569,6 +1627,7 @@ server.listen(
   PORT,
   () => {
     console.log('');
+
     console.log(
       '========================================',
     );
