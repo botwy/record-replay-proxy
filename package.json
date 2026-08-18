@@ -10,6 +10,7 @@
     "start": "node --experimental-strip-types proxy.ts replay",
     "record": "node --experimental-strip-types proxy.ts record",
     "replay": "node --experimental-strip-types proxy.ts replay",
+    "rest:list": "node --experimental-strip-types proxy.ts rest:list",
     "ws:list": "node --experimental-strip-types proxy.ts ws:list",
     "ws:send": "node --experimental-strip-types proxy.ts ws:send"
   },

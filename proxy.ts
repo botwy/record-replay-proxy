@@ -7,1629 +7,1617 @@ import { Readable } from 'node:stream';
 
 import httpProxy from 'http-proxy';
 import WebSocket, {
-  WebSocketServer,
+  WebSocketServer,
 } from 'ws';
 import picomatch from 'picomatch';
 
-/*
- * ============================================================
- * TYPES
- * ============================================================
- */
-
 type Config = {
-  target: string;
-  port: number;
+  target: string;
+  port: number;
 
-  tls?: {
-    rejectUnauthorized?: boolean;
-  };
+  tls?: {
+    rejectUnauthorized?: boolean;
+  };
 
-  record: {
-    include: string[];
-    exclude?: string[];
-    contentTypes: string[];
-  };
+  record: {
+    include: string[];
+    exclude?: string[];
+    contentTypes: string[];
+  };
 };
 
 type HttpRecording = {
-  key: string;
-  method: string;
-  url: string;
-  requestBody: string;
+  key: string;
+  method: string;
+  url: string;
+  requestBody: string;
 
-  response: {
-    status: number;
-    headers: Record<string, string>;
-    body: string;
-  };
+  response: {
+    status: number;
+    headers: Record<string, string>;
+    body: string;
+    bodyEncoding?: 'utf8' | 'base64';
+  };
 };
 
 type WsRecording = {
-  id: string;
-  url: string;
-  binary: boolean;
-  data: string;
-  createdAt: string;
+  id: string;
+  url: string;
+  binary: boolean;
+  data: string;
+  dataEncoding?: 'utf8' | 'base64';
+  createdAt: string;
 };
 
 /*
- * ============================================================
- * CONFIG
- * ============================================================
- */
+ * ============================================================
+ * CONFIG
+ * ============================================================
+ */
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const configPath = path.join(
-  __dirname,
-  'config.json'
+  __dirname,
+  'config.json',
 );
 
 const config: Config = JSON.parse(
-  fs.readFileSync(
-    configPath,
-    'utf8'
-  )
+  fs.readFileSync(
+    configPath,
+    'utf8',
+  ),
 );
 
 const command =
-  process.argv[2] ?? 'replay';
+  process.argv[2] ?? 'replay';
 
 const validCommands = [
-  'record',
-  'replay',
-  'ws:list',
-  'ws:send',
+  'record',
+  'replay',
+  'ws:list',
+  'ws:send',
+  'rest:list',
 ];
 
 if (!validCommands.includes(command)) {
-  console.error(`
+  console.error(`
 Usage:
 
-  npm run record
-  npm run replay
+  npm run record
+  npm run replay
 
-  npm run ws:list
-  npm run ws:send -- <id>
+  npm run ws:list
+  npm run ws:send -- <id>
+
+  npm run rest:list
 `);
 
-  process.exit(1);
+  process.exit(1);
 }
 
 const mode =
-  command === 'record'
-    ? 'record'
-    : 'replay';
+  command === 'record'
+    ? 'record'
+    : 'replay';
 
 const PORT = config.port;
 const TARGET = config.target;
 
 const rejectUnauthorized =
-  config.tls?.rejectUnauthorized ??
-  true;
+  config.tls?.rejectUnauthorized ?? true;
 
 /*
- * ============================================================
- * DIRECTORIES
- * ============================================================
- */
+ * ============================================================
+ * DIRECTORIES
+ * ============================================================
+ */
 
-const recordingsDir =
-  path.join(
-    __dirname,
-    'recordings'
-  );
+const recordingsDir = path.join(
+  __dirname,
+  'recordings',
+);
 
-const httpDir =
-  path.join(
-    recordingsDir,
-    'http'
-  );
+const httpDir = path.join(
+  recordingsDir,
+  'http',
+);
 
-const wsDir =
-  path.join(
-    recordingsDir,
-    'ws'
-  );
-
-/*
- * mkdir -p
- *
- * Создаёт всю цепочку директорий,
- * если её ещё нет.
- */
-
-fs.mkdirSync(
-  httpDir,
-  {
-    recursive: true,
-  }
+const wsDir = path.join(
+  recordingsDir,
+  'ws',
 );
 
 fs.mkdirSync(
-  wsDir,
-  {
-    recursive: true,
-  }
+  httpDir,
+  { recursive: true },
+);
+
+fs.mkdirSync(
+  wsDir,
+  { recursive: true },
 );
 
 /*
- * ============================================================
- * GLOB MATCHERS
- * ============================================================
- */
+ * ============================================================
+ * GLOB MATCHERS
+ * ============================================================
+ */
 
-const includeMatcher =
-  picomatch(
-    config.record.include
-  );
+const includeMatcher = picomatch(
+  config.record.include,
+);
 
-const excludeMatcher =
-  picomatch(
-    config.record.exclude ?? []
-  );
+const excludeMatcher = picomatch(
+  config.record.exclude ?? [],
+);
 
 /*
- * ============================================================
- * HTTP RECORD FILTER
- * ============================================================
- *
- * Проверяем только pathname.
- *
- * Поэтому:
- *
- * https://example.com/api/users
- *
- * и:
- *
- * /api/users
- *
- * оба проверяются как:
- *
- * /api/users
- */
+ * ============================================================
+ * RECORD SCOPE
+ * ============================================================
+ */
 
 function isInRecordScope(
-  requestUrl: string
+  requestUrl: string,
 ): boolean {
-  const url =
-    new URL(
-      requestUrl,
-      TARGET
-    );
+  const url = new URL(
+    requestUrl,
+    TARGET,
+  );
 
-  const pathname =
-    url.pathname;
+  const pathname = url.pathname;
 
-  if (
-    !includeMatcher(pathname)
-  ) {
-    return false;
-  }
+  if (!includeMatcher(pathname)) {
+    return false;
+  }
 
-  if (
-    excludeMatcher(pathname)
-  ) {
-    return false;
-  }
+  if (excludeMatcher(pathname)) {
+    return false;
+  }
 
-  return true;
+  return true;
 }
 
 /*
- * ============================================================
- * CONTENT TYPE FILTER
- * ============================================================
- *
- * Используется только при RECORD.
- */
+ * ============================================================
+ * CONTENT TYPE
+ * ============================================================
+ */
 
 function shouldRecordResponse(
-  requestUrl: string,
-  contentType: string
+  requestUrl: string,
+  contentType: string,
 ): boolean {
-  if (
-    !isInRecordScope(
-      requestUrl
-    )
-  ) {
-    return false;
-  }
+  if (!isInRecordScope(requestUrl)) {
+    return false;
+  }
 
-  const normalized =
-    contentType.toLowerCase();
+  const normalized =
+    contentType.toLowerCase();
 
-  return config.record.contentTypes.some(
-    type =>
-      normalized.includes(
-        type.toLowerCase()
-      )
-  );
+  return config.record.contentTypes.some(
+    type =>
+      normalized.includes(
+        type.toLowerCase(),
+      ),
+  );
 }
 
 /*
- * ============================================================
- * HELPERS
- * ============================================================
- */
+ * ============================================================
+ * HELPERS
+ * ============================================================
+ */
 
 function sha256(
-  value: string
+  value: string,
 ): string {
-  return crypto
-    .createHash('sha256')
-    .update(value)
-    .digest('hex');
+  return crypto
+    .createHash('sha256')
+    .update(value)
+    .digest('hex');
 }
 
 function makeRequestKey(
-  method: string,
-  url: string,
-  body: string
+  method: string,
+  url: string,
+  body: string,
 ): string {
-  return sha256(
-    [
-      method.toUpperCase(),
-      url,
-      body,
-    ].join('\n')
-  );
+  return sha256(
+    [
+      method.toUpperCase(),
+      url,
+      body,
+    ].join('\n'),
+  );
 }
 
 function readBody(
-  req: http.IncomingMessage,
+  req: http.IncomingMessage,
 ): Promise<Buffer> {
-  return new Promise(
-    (resolve, reject) => {
-      const chunks: Buffer[] = [];
+  return new Promise(
+    (resolve, reject) => {
+      const chunks: Buffer[] = [];
 
-      req.on(
-        'data',
-        chunk => {
-          chunks.push(
-            Buffer.isBuffer(chunk)
-              ? chunk
-              : Buffer.from(chunk)
-          );
-        }
-      );
+      req.on(
+        'data',
+        chunk => {
+          chunks.push(
+            Buffer.isBuffer(chunk)
+              ? chunk
+              : Buffer.from(chunk),
+          );
+        },
+      );
 
-      req.on(
-        'end',
-        () => {
-          resolve(
-            Buffer.concat(chunks)
-          );
-        }
-      );
+      req.on(
+        'end',
+        () => {
+          resolve(
+            Buffer.concat(chunks),
+          );
+        },
+      );
 
-      req.on(
-        'error',
-        reject
-      );
-    }
-  );
+      req.on(
+        'error',
+        reject,
+      );
+    },
+  );
 }
 
 function headersToObject(
-  headers: http.IncomingHttpHeaders,
+  headers: http.IncomingHttpHeaders,
 ) {
-  const result: Record<
-    string,
-    string
-  > = {};
+  const result: Record<
+    string,
+    string
+  > = {};
 
-  for (
-    const [key, value]
-    of Object.entries(headers)
-  ) {
-    if (
-      value === undefined
-    ) {
-      continue;
-    }
+  for (
+    const [key, value]
+    of Object.entries(headers)
+  ) {
+    if (value === undefined) {
+      continue;
+    }
 
-    result[key] =
-      Array.isArray(value)
-        ? value.join(', ')
-        : value;
-  }
+    result[key] =
+      Array.isArray(value)
+        ? value.join(', ')
+        : value;
+  }
 
-  return result;
+  return result;
 }
 
 function sendJson(
-  res: http.ServerResponse,
-  status: number,
-  data: unknown
+  res: http.ServerResponse,
+  status: number,
+  data: unknown,
 ) {
-  const body =
-    JSON.stringify(
-      data,
-      null,
-      2
-    );
+  const body = JSON.stringify(
+    data,
+    null,
+    2,
+  );
 
-  res.writeHead(
-    status,
-    {
-      'content-type':
-        'application/json; charset=utf-8',
+  res.writeHead(
+    status,
+    {
+      'content-type':
+        'application/json; charset=utf-8',
 
-      'content-length':
-        String(
-          Buffer.byteLength(body)
-        ),
-    }
-  );
+      'content-length':
+        String(
+          Buffer.byteLength(body),
+        ),
+    },
+  );
 
-  res.end(body);
+  res.end(body);
+}
+
+function makeWsId(
+  createdAt: string,
+): string {
+  const iso =
+    new Date(createdAt)
+      .toISOString()
+      .replace(/:/g, '-')
+      .replace(/\./g, '-');
+
+  const suffix =
+    crypto
+      .randomBytes(4)
+      .toString('hex');
+
+  return `${iso}-${suffix}`;
 }
 
 /*
- * ============================================================
- * HTTP PROXY
- * ============================================================
- */
+ * ============================================================
+ * HTTP PROXY
+ * ============================================================
+ */
 
 const proxy =
-  httpProxy.createProxyServer({
-    changeOrigin: true,
-
-    secure:
-      rejectUnauthorized,
-  });
+  httpProxy.createProxyServer({
+    changeOrigin: true,
+    secure: rejectUnauthorized,
+  });
 
 proxy.on(
-  'error',
-  (
-    error,
-    _req,
-    res
-  ) => {
-    console.error(
-      '[PROXY ERROR]',
-      error.message
-    );
+  'error',
+  (
+    error,
+    _req,
+    res,
+  ) => {
+    console.error(
+      '[PROXY ERROR]',
+      error.message,
+    );
 
-    if (
-      res &&
-      !res.headersSent
-    ) {
-      res.writeHead(502);
-
-      res.end(
-        'Proxy error'
-      );
-    }
-  }
+    if (
+      res &&
+      !res.headersSent
+    ) {
+      res.writeHead(502);
+      res.end('Proxy error');
+    }
+  },
 );
 
 /*
- * ============================================================
- * HTTP → REAL TARGET
- * ============================================================
- *
- * Используется как fallback в replay.
- */
+ * ============================================================
+ * PROXY TO TARGET
+ * ============================================================
+ */
 
 function proxyToTarget(
-  req: http.IncomingMessage,
-  res: http.ServerResponse,
-  bodyBuffer: Buffer
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  bodyBuffer: Buffer,
 ) {
-  proxy.web(
-    req,
-    res,
-    {
-      target: TARGET,
+  proxy.web(
+    req,
+    res,
+    {
+      target: TARGET,
 
-      buffer:
-        Readable.from(
-          bodyBuffer
-        ),
-    }
-  );
+      buffer:
+        Readable.from(
+          bodyBuffer,
+        ),
+    },
+  );
 }
 
 /*
- * ============================================================
- * RECORD HTTP
- * ============================================================
- */
+ * ============================================================
+ * RECORD HTTP
+ * ============================================================
+ */
 
 async function recordHttp(
-  req: http.IncomingMessage,
-  res: http.ServerResponse
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
 ) {
-  const bodyBuffer =
-    await readBody(req);
+  const bodyBuffer =
+    await readBody(req);
 
-  const body =
-    bodyBuffer.toString(
-      'utf8'
-    );
+  const body =
+    bodyBuffer.toString('utf8');
 
-  const method =
-    req.method ?? 'GET';
+  const method =
+    req.method ?? 'GET';
 
-  const url =
-    req.url ?? '/';
+  const url =
+    req.url ?? '/';
 
-  /*
-   * Всегда отправляем запрос на реальный стенд.
-   *
-   * Запись решается только после получения
-   * response headers.
-   */
+  const onProxyRes = (
+    proxyRes: http.IncomingMessage,
+  ) => {
+    const contentType =
+      String(
+        proxyRes.headers[
+          'content-type'
+        ] ?? '',
+      );
 
-  proxy.once(
-    'proxyRes',
-    proxyRes => {
-      const contentType =
-        String(
-          proxyRes.headers[
-            'content-type'
-          ] ?? ''
-        );
+    if (
+      !shouldRecordResponse(
+        url,
+        contentType,
+      )
+    ) {
+      return;
+    }
 
-      /*
-       * URL или Content-Type не подходят —
-       * ничего не сохраняем.
-       */
+    const chunks: Buffer[] = [];
 
-      if (
-        !shouldRecordResponse(
-          url,
-          contentType
-        )
-      ) {
-        return;
-      }
+    proxyRes.on(
+      'data',
+      chunk => {
+        chunks.push(
+          Buffer.isBuffer(chunk)
+            ? chunk
+            : Buffer.from(chunk),
+        );
+      },
+    );
 
-      const chunks: Buffer[] = [];
+    proxyRes.on(
+      'end',
+      () => {
+        const responseBody =
+          Buffer.concat(chunks);
 
-      proxyRes.on(
-        'data',
-        chunk => {
-          chunks.push(
-            Buffer.isBuffer(chunk)
-              ? chunk
-              : Buffer.from(chunk)
-          );
-        }
-      );
+        const normalizedContentType =
+          contentType.toLowerCase();
 
-      proxyRes.on(
-        'end',
-        () => {
-          const responseBody =
-            Buffer.concat(chunks);
+        const isJson =
+          normalizedContentType.includes(
+            'application/json',
+          ) ||
+          normalizedContentType.includes(
+            '+json',
+          );
 
-          const key =
-            makeRequestKey(
-              method,
-              url,
-              body
-            );
+        const key =
+          makeRequestKey(
+            method,
+            url,
+            body,
+          );
 
-          const recording:
-            HttpRecording = {
-              key,
+        const recording:
+          HttpRecording = {
+            key,
 
-              method,
+            method,
 
-              url,
+            url,
 
-              requestBody:
-                body,
+            requestBody: body,
 
-              response: {
-                status:
-                  proxyRes.statusCode ??
-                  500,
+            response: {
+              status:
+                proxyRes.statusCode ??
+                500,
 
-                headers:
-                  headersToObject(
-                    proxyRes.headers
-                  ),
+              headers:
+                headersToObject(
+                  proxyRes.headers,
+                ),
 
-                body:
-                  responseBody.toString(
-                    'base64'
-                  ),
-              },
-            };
+              body:
+                isJson
+                  ? responseBody.toString(
+                      'utf8',
+                    )
+                  : responseBody.toString(
+                      'base64',
+                    ),
 
-          const filename =
-            path.join(
-              httpDir,
-              `${key}.json`
-            );
+              bodyEncoding:
+                isJson
+                  ? 'utf8'
+                  : 'base64',
+            },
+          };
 
-          fs.writeFileSync(
-            filename,
-            JSON.stringify(
-              recording,
-              null,
-              2
-            )
-          );
+        const filename =
+          path.join(
+            httpDir,
+            `${key}.json`,
+          );
 
-          console.log(
-            `[HTTP RECORD] ${method} ${url}`
-          );
-        }
-      );
-    }
-  );
+        fs.writeFileSync(
+          filename,
+          JSON.stringify(
+            recording,
+            null,
+            2,
+          ),
+        );
 
-  console.log(
-    `[HTTP → TARGET] ${method} ${url}`
-  );
+        console.log(
+          `[HTTP RECORD] ${method} ${url}`,
+        );
+      },
+    );
+  };
 
-  proxyToTarget(
-    req,
-    res,
-    bodyBuffer
-  );
+  proxy.once(
+    'proxyRes',
+    onProxyRes,
+  );
+
+  console.log(
+    `[HTTP → TARGET] ${method} ${url}`,
+  );
+
+  proxyToTarget(
+    req,
+    res,
+    bodyBuffer,
+  );
 }
 
 /*
- * ============================================================
- * REPLAY HTTP
- * ============================================================
- *
- * ВАЖНАЯ ЛОГИКА:
- *
- * 1. URL НЕ входит в include/exclude
- *      → real target
- *
- * 2. URL входит, recording найден
- *      → replay
- *
- * 3. URL входит, recording НЕ найден
- *      → real target
- *
- * Таким образом replay является fallback proxy.
- */
+ * ============================================================
+ * REPLAY HTTP
+ * ============================================================
+ */
 
 async function replayHttp(
-  req: http.IncomingMessage,
-  res: http.ServerResponse
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
 ) {
-  const bodyBuffer =
-    await readBody(req);
+  const bodyBuffer =
+    await readBody(req);
 
-  const body =
-    bodyBuffer.toString(
-      'utf8'
-    );
+  const body =
+    bodyBuffer.toString('utf8');
 
-  const method =
-    req.method ?? 'GET';
+  const method =
+    req.method ?? 'GET';
 
-  const url =
-    req.url ?? '/';
+  const url =
+    req.url ?? '/';
 
-  /*
-   * ----------------------------------------------------------
-   * 1. URL не входит в record scope
-   * ----------------------------------------------------------
-   */
+  /*
+   * Не входит в include/exclude —
+   * обычный proxy.
+   */
 
-  if (
-    !isInRecordScope(url)
-  ) {
-    console.log(
-      `[HTTP → TARGET] ${method} ${url}`
-    );
+  if (!isInRecordScope(url)) {
+    console.log(
+      `[HTTP → TARGET] ${method} ${url}`,
+    );
 
-    proxyToTarget(
-      req,
-      res,
-      bodyBuffer
-    );
+    proxyToTarget(
+      req,
+      res,
+      bodyBuffer,
+    );
 
-    return;
-  }
+    return;
+  }
 
-  /*
-   * ----------------------------------------------------------
-   * 2. URL входит в scope.
-   * Ищем конкретную запись.
-   * ----------------------------------------------------------
-   */
+  const key =
+    makeRequestKey(
+      method,
+      url,
+      body,
+    );
 
-  const key =
-    makeRequestKey(
-      method,
-      url,
-      body
-    );
+  const filename =
+    path.join(
+      httpDir,
+      `${key}.json`,
+    );
 
-  const filename =
-    path.join(
-      httpDir,
-      `${key}.json`
-    );
+  /*
+   * В scope, но записи нет —
+   * fallback на target.
+   */
 
-  /*
-   * ----------------------------------------------------------
-   * 3. Записи нет → fallback на стенд
-   * ----------------------------------------------------------
-   */
+  if (!fs.existsSync(filename)) {
+    console.log(
+      `[HTTP MISS → TARGET] ${method} ${url}`,
+    );
 
-  if (
-    !fs.existsSync(
-      filename
-    )
-  ) {
-    console.log(
-      `[HTTP MISS → TARGET] ${method} ${url}`
-    );
+    proxyToTarget(
+      req,
+      res,
+      bodyBuffer,
+    );
 
-    proxyToTarget(
-      req,
-      res,
-      bodyBuffer
-    );
+    return;
+  }
 
-    return;
-  }
+  const recording:
+    HttpRecording =
+    JSON.parse(
+      fs.readFileSync(
+        filename,
+        'utf8',
+      ),
+    );
 
-  /*
-   * ----------------------------------------------------------
-   * 4. Запись найдена → REPLAY
-   * ----------------------------------------------------------
-   */
+  const encoding =
+    recording.response.bodyEncoding ??
+    'base64';
 
-  const recording:
-    HttpRecording =
-    JSON.parse(
-      fs.readFileSync(
-        filename,
-        'utf8'
-      )
-    );
+  const responseBody =
+    Buffer.from(
+      recording.response.body,
+      encoding,
+    );
 
-  const responseBody =
-    Buffer.from(
-      recording.response.body,
-      'base64'
-    );
+  const headers = {
+    ...recording.response.headers,
+  };
 
-  const headers = {
-    ...recording.response.headers,
-  };
+  delete headers.connection;
+  delete headers['transfer-encoding'];
 
-  /*
-   * Эти headers нельзя слепо возвращать
-   * из старого HTTP response.
-   */
+  headers['content-length'] =
+    String(
+      responseBody.length,
+    );
 
-  delete headers.connection;
+  console.log(
+    `[HTTP REPLAY] ${method} ${url}`,
+  );
 
-  delete headers['transfer-encoding'];
+  res.writeHead(
+    recording.response.status,
+    headers,
+  );
 
-  headers['content-length'] =
-    String(
-      responseBody.length
-    );
-
-  console.log(
-    `[HTTP REPLAY] ${method} ${url}`
-  );
-
-  res.writeHead(
-    recording.response.status,
-    headers
-  );
-
-  res.end(
-    responseBody
-  );
+  res.end(responseBody);
 }
 
 /*
- * ============================================================
- * REPLAY WEBSOCKET SERVER
- * ============================================================
- *
- * В replay режиме мы НЕ подключаемся к стенду.
- *
- * Браузер подключается сюда,
- * а ws:send отправляет ему сохранённое событие.
- */
+ * ============================================================
+ * WEBSOCKET REPLAY SERVER
+ * ============================================================
+ */
 
 const replayWss =
-  new WebSocketServer({
-    noServer: true,
-  });
+  new WebSocketServer({
+    noServer: true,
+  });
 
 const replayClients =
-  new Set<WebSocket>();
+  new Set<WebSocket>();
 
 replayWss.on(
-  'connection',
-  ws => {
-    console.log(
-      '[WS] client connected'
-    );
+  'connection',
+  ws => {
+    console.log(
+      '[WS] client connected',
+    );
 
-    replayClients.add(
-      ws
-    );
+    replayClients.add(ws);
 
-    ws.on(
-      'close',
-      () => {
-        replayClients.delete(
-          ws
-        );
+    ws.on(
+      'close',
+      () => {
+        replayClients.delete(ws);
 
-        console.log(
-          '[WS] client disconnected'
-        );
-      }
-    );
+        console.log(
+          '[WS] client disconnected',
+        );
+      },
+    );
 
-    ws.on(
-      'error',
-      () => {
-        replayClients.delete(
-          ws
-        );
-      }
-    );
+    ws.on(
+      'error',
+      () => {
+        replayClients.delete(ws);
+      },
+    );
 
-    /*
-     * В replay мы не пересылаем
-     * browser → server.
-     *
-     * Просто логируем.
-     */
-
-    ws.on(
-      'message',
-      data => {
-        console.log(
-          '[WS CLIENT → PROXY]',
-          data.toString()
-        );
-      }
-    );
-  }
+    ws.on(
+      'message',
+      data => {
+        console.log(
+          '[WS CLIENT → PROXY]',
+          data.toString(),
+        );
+      },
+    );
+  },
 );
 
 /*
- * ============================================================
- * RECORD WEBSOCKET
- * ============================================================
- *
- * Browser
- *   ↓
- * local proxy
- *   ↓
- * real stand
- *
- * И обратно:
- *
- * real stand
- *   ↓
- * local proxy
- *   ↓
- * browser
- *
- * Сохраняем только:
- *
- * real stand → browser
- */
+ * ============================================================
+ * WEBSOCKET RECORD SERVER
+ * ============================================================
+ */
+
+const recordWss =
+  new WebSocketServer({
+    noServer: true,
+  });
+
+recordWss.on(
+  'connection',
+  (
+    browserWs,
+    req,
+  ) => {
+    recordWebSocket(
+      req,
+      browserWs,
+    );
+  },
+);
+
+/*
+ * ============================================================
+ * RECORD WEBSOCKET
+ * ============================================================
+ */
 
 function recordWebSocket(
-  req: http.IncomingMessage,
-  browserWs: WebSocket
+  req: http.IncomingMessage,
+  browserWs: WebSocket,
 ) {
-  const targetUrl =
-    new URL(TARGET);
+  const targetUrl =
+    new URL(TARGET);
 
-  const wsProtocol =
-    targetUrl.protocol === 'https:'
-      ? 'wss:'
-      : 'ws:';
+  const wsProtocol =
+    targetUrl.protocol === 'https:'
+      ? 'wss:'
+      : 'ws:';
 
-  const wsUrl =
-    `${wsProtocol}//${targetUrl.host}${req.url ?? '/'}`;
+  const wsUrl =
+    `${wsProtocol}//${targetUrl.host}${req.url ?? '/'}`;
 
-  const headers:
-    Record<string, string> = {};
+  const headers:
+    Record<string, string> = {};
 
-  for (
-    const [key, value]
-    of Object.entries(
-      req.headers
-    )
-  ) {
-    if (
-      value === undefined
-    ) {
-      continue;
-    }
+  for (
+    const [key, value]
+    of Object.entries(req.headers)
+  ) {
+    if (value === undefined) {
+      continue;
+    }
 
-    /*
-     * WebSocket library создаст
-     * эти headers самостоятельно.
-     */
+    if (
+      key === 'host' ||
+      key === 'connection' ||
+      key === 'upgrade' ||
+      key === 'sec-websocket-key' ||
+      key === 'sec-websocket-version' ||
+      key === 'sec-websocket-extensions' ||
+      key === 'sec-websocket-protocol'
+    ) {
+      continue;
+    }
 
-    if (
-      key === 'host' ||
-      key === 'connection' ||
-      key === 'upgrade' ||
-      key === 'sec-websocket-key' ||
-      key === 'sec-websocket-version' ||
-      key === 'sec-websocket-extensions'
-    ) {
-      continue;
-    }
+    headers[key] =
+      Array.isArray(value)
+        ? value.join(', ')
+        : value;
+  }
 
-    headers[key] =
-      Array.isArray(value)
-        ? value.join(', ')
-        : value;
-  }
+  const protocolHeader =
+    req.headers[
+      'sec-websocket-protocol'
+    ];
 
-  const protocolHeader =
-    req.headers[
-      'sec-websocket-protocol'
-    ];
+  const protocols =
+    protocolHeader
+      ? String(protocolHeader)
+          .split(',')
+          .map(
+            value =>
+              value.trim(),
+          )
+      : undefined;
 
-  const protocols =
-    protocolHeader
-      ? String(
-          protocolHeader
-        )
-          .split(',')
-          .map(
-            value =>
-              value.trim()
-          )
-      : undefined;
+  const targetWs =
+    new WebSocket(
+      wsUrl,
+      protocols,
+      {
+        headers,
 
-  const targetWs =
-    new WebSocket(
-      wsUrl,
-      protocols,
-      {
-        headers,
+        rejectUnauthorized:
+          rejectUnauthorized,
+      },
+    );
 
-        rejectUnauthorized:
-          rejectUnauthorized,
-      }
-    );
+  targetWs.on(
+    'open',
+    () => {
+      console.log(
+        `[WS RECORD] connected ${wsUrl}`,
+      );
 
-  targetWs.on(
-    'open',
-    () => {
-      console.log(
-        `[WS RECORD] connected ${wsUrl}`
-      );
+      browserWs.on(
+        'message',
+        (
+          data,
+          isBinary,
+        ) => {
+          if (
+            targetWs.readyState ===
+            WebSocket.OPEN
+          ) {
+            targetWs.send(
+              data,
+              {
+                binary: isBinary,
+              },
+            );
+          }
+        },
+      );
 
-      /*
-       * Browser → real server
-       */
+      targetWs.on(
+        'message',
+        (
+          data,
+          isBinary,
+        ) => {
+          if (
+            browserWs.readyState ===
+            WebSocket.OPEN
+          ) {
+            browserWs.send(
+              data,
+              {
+                binary: isBinary,
+              },
+            );
+          }
 
-      browserWs.on(
-        'message',
-        (
-          data,
-          isBinary
-        ) => {
-          if (
-            targetWs.readyState ===
-            WebSocket.OPEN
-          ) {
-            targetWs.send(
-              data,
-              {
-                binary:
-                  isBinary,
-              }
-            );
-          }
-        }
-      );
+          saveWsMessage(
+            req.url ?? '/',
+            data,
+            isBinary,
+          );
+        },
+      );
+    },
+  );
 
-      /*
-       * Real server → browser
-       *
-       * Сохраняем сообщение.
-       */
+  targetWs.on(
+    'error',
+    error => {
+      console.error(
+        '[WS TARGET ERROR]',
+        error.message,
+      );
 
-      targetWs.on(
-        'message',
-        (
-          data,
-          isBinary
-        ) => {
-          if (
-            browserWs.readyState ===
-            WebSocket.OPEN
-          ) {
-            browserWs.send(
-              data,
-              {
-                binary:
-                  isBinary,
-              }
-            );
-          }
+      if (
+        browserWs.readyState ===
+        WebSocket.OPEN
+      ) {
+        browserWs.close(
+          1011,
+          'Target WebSocket error',
+        );
+      }
+    },
+  );
 
-          saveWsMessage(
-            req.url ?? '/',
-            data,
-            isBinary
-          );
-        }
-      );
-    }
-  );
+  targetWs.on(
+    'close',
+    (
+      code,
+      reason,
+    ) => {
+      console.log(
+        `[WS TARGET CLOSE] ${code}`,
+      );
 
-  targetWs.on(
-    'error',
-    error => {
-      console.error(
-        '[WS TARGET ERROR]',
-        error.message
-      );
+      if (
+        browserWs.readyState ===
+        WebSocket.OPEN
+      ) {
+        browserWs.close(
+          code,
+          reason,
+        );
+      }
+    },
+  );
 
-      if (
-        browserWs.readyState ===
-        WebSocket.OPEN
-      ) {
-        browserWs.close(
-          1011,
-          'Target WebSocket error'
-        );
-      }
-    }
-  );
+  browserWs.on(
+    'close',
+    () => {
+      if (
+        targetWs.readyState ===
+        WebSocket.OPEN
+      ) {
+        targetWs.close();
+      }
+    },
+  );
 
-  targetWs.on(
-    'close',
-    (
-      code,
-      reason
-    ) => {
-      console.log(
-        `[WS TARGET CLOSE] ${code}`
-      );
-
-      if (
-        browserWs.readyState ===
-        WebSocket.OPEN
-      ) {
-        browserWs.close(
-          code,
-          reason
-        );
-      }
-    }
-  );
-
-  browserWs.on(
-    'close',
-    () => {
-      if (
-        targetWs.readyState ===
-        WebSocket.OPEN
-      ) {
-        targetWs.close();
-      }
-    }
-  );
-
-  browserWs.on(
-    'error',
-    () => {
-      targetWs.close();
-    }
-  );
+  browserWs.on(
+    'error',
+    () => {
+      targetWs.close();
+    },
+  );
 }
 
 /*
- * ============================================================
- * SAVE WS MESSAGE
- * ============================================================
- */
+ * ============================================================
+ * SAVE WS MESSAGE
+ * ============================================================
+ */
 
 function saveWsMessage(
-  url: string,
-  data: WebSocket.RawData,
-  binary: boolean
+  url: string,
+  data: WebSocket.RawData,
+  binary: boolean,
 ) {
-  const id =
-    `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const createdAt =
+    new Date().toISOString();
 
-  const buffer =
-    Buffer.isBuffer(data)
-      ? data
-      : Buffer.from(
-          data as ArrayBuffer
-        );
+  const id =
+    makeWsId(createdAt);
 
-  const recording:
-    WsRecording = {
-      id,
+  const buffer =
+    Buffer.isBuffer(data)
+      ? data
+      : Buffer.from(
+          data as ArrayBuffer,
+        );
 
-      url,
+  const recording:
+    WsRecording = {
+      id,
 
-      binary,
+      url,
 
-      data:
-        buffer.toString(
-          'base64'
-        ),
+      binary,
 
-      createdAt:
-        new Date().toISOString(),
-    };
+      data:
+        binary
+          ? buffer.toString(
+              'base64',
+            )
+          : buffer.toString(
+              'utf8',
+            ),
 
-  const filename =
-    path.join(
-      wsDir,
-      `${id}.json`
-    );
+      dataEncoding:
+        binary
+          ? 'base64'
+          : 'utf8',
 
-  fs.writeFileSync(
-    filename,
-    JSON.stringify(
-      recording,
-      null,
-      2
-    )
-  );
+      createdAt,
+    };
 
-  console.log(
-    `[WS RECORD] ${id}`
-  );
+  const filename =
+    path.join(
+      wsDir,
+      `${id}.json`,
+    );
+
+  fs.writeFileSync(
+    filename,
+    JSON.stringify(
+      recording,
+      null,
+      2,
+    ),
+  );
+
+  console.log(
+    `[WS RECORD] ${id}`,
+  );
 }
 
 /*
- * ============================================================
- * WS RECORDINGS LIST
- * ============================================================
- */
+ * ============================================================
+ * WS LIST
+ * ============================================================
+ */
 
 function getWsRecordings():
-  WsRecording[] {
-  return fs
-    .readdirSync(wsDir)
-    .filter(
-      file =>
-        file.endsWith('.json')
-    )
-    .sort()
-    .map(
-      file =>
-        JSON.parse(
-          fs.readFileSync(
-            path.join(
-              wsDir,
-              file
-            ),
-            'utf8'
-          )
-        )
-    );
+  WsRecording[] {
+  if (!fs.existsSync(wsDir)) {
+    return [];
+  }
+
+  return fs
+    .readdirSync(wsDir)
+    .filter(
+      file =>
+        file.endsWith('.json'),
+    )
+    .sort()
+    .map(
+      file =>
+        JSON.parse(
+          fs.readFileSync(
+            path.join(
+              wsDir,
+              file,
+            ),
+            'utf8',
+          ),
+        ),
+    );
 }
 
 function printWsList() {
-  const recordings =
-    getWsRecordings();
+  const recordings =
+    getWsRecordings();
 
-  if (
-    recordings.length === 0
-  ) {
-    console.log(
-      'No WebSocket recordings found.'
-    );
+  if (
+    recordings.length === 0
+  ) {
+    console.log(
+      'No WebSocket recordings found.',
+    );
 
-    return;
-  }
+    return;
+  }
 
-  for (
-    const recording
-    of recordings
-  ) {
-    let message: string;
+  for (
+    const recording
+    of recordings
+  ) {
+    console.log('');
+    console.log(
+      `ID:          ${recording.id}`,
+    );
 
-    if (
-      recording.binary
-    ) {
-      message =
-        '<binary>';
-    } else {
-      /*
-       * ВАЖНО:
-       *
-       * Никакого slice().
-       *
-       * Выводим всё сообщение целиком,
-       * включая переносы строк.
-       */
+    console.log(
+      `URL:         ${recording.url}`,
+    );
 
-      message =
-        Buffer.from(
-          recording.data,
-          'base64'
-        ).toString(
-          'utf8'
-        );
-    }
+    console.log(
+      `Binary:      ${recording.binary}`,
+    );
 
-    console.log('');
-    console.log(
-      `ID:      ${recording.id}`
-    );
-    console.log(
-      `URL:     ${recording.url}`
-    );
-    console.log(
-      `Binary:  ${recording.binary}`
-    );
-    console.log(
-      `Created: ${recording.createdAt}`
-    );
-    console.log(
-      'Message:'
-    );
+    console.log(
+      `Encoding:    ${
+        recording.dataEncoding ??
+        (
+          recording.binary
+            ? 'base64'
+            : 'utf8'
+        )
+      }`,
+    );
 
-    console.log(
-      message
-    );
-  }
+    console.log(
+      `Created:     ${recording.createdAt}`,
+    );
 
-  console.log('');
-  console.log(
-    `Total: ${recordings.length}`
-  );
+    console.log(
+      'Message:',
+    );
+
+    if (recording.binary) {
+      console.log(
+        '<binary>',
+      );
+    } else {
+      console.log(
+        recording.data,
+      );
+    }
+  }
+
+  console.log('');
+  console.log(
+    `Total: ${recordings.length}`,
+  );
 }
 
 /*
- * ============================================================
- * WS SEND CLI
- * ============================================================
- *
- * Этот код выполняется в отдельном процессе.
- *
- * Он НЕ имеет доступа к replayClients напрямую.
- *
- * Вместо этого делает HTTP POST
- * в уже запущенный replay proxy.
- */
+ * ============================================================
+ * REST LIST
+ * ============================================================
+ */
+
+function printRestList() {
+  if (!fs.existsSync(httpDir)) {
+    console.log(
+      'No REST recordings found.',
+    );
+
+    return;
+  }
+
+  const files =
+    fs
+      .readdirSync(httpDir)
+      .filter(
+        file =>
+          file.endsWith('.json'),
+      )
+      .sort();
+
+  if (files.length === 0) {
+    console.log(
+      'No REST recordings found.',
+    );
+
+    return;
+  }
+
+  for (
+    const file
+    of files
+  ) {
+    const filename =
+      path.join(
+        httpDir,
+        file,
+      );
+
+    const recording:
+      HttpRecording =
+      JSON.parse(
+        fs.readFileSync(
+          filename,
+          'utf8',
+        ),
+      );
+
+    const contentType =
+      recording.response.headers[
+        'content-type'
+      ] ?? '';
+
+    console.log('');
+    console.log(
+      `Key:          ${recording.key}`,
+    );
+
+    console.log(
+      `Method:       ${recording.method}`,
+    );
+
+    console.log(
+      `URL:          ${recording.url}`,
+    );
+
+    console.log(
+      `Status:       ${recording.response.status}`,
+    );
+
+    console.log(
+      `Content-Type: ${contentType}`,
+    );
+
+    console.log(
+      `Encoding:     ${
+        recording.response.bodyEncoding ??
+        'base64'
+      }`,
+    );
+
+    console.log(
+      `File:         ${file}`,
+    );
+
+    console.log(
+      'Request body:',
+    );
+
+    console.log(
+      recording.requestBody ||
+      '<empty>',
+    );
+
+    console.log(
+      'Response body:',
+    );
+
+    if (
+      recording.response.bodyEncoding ===
+      'base64'
+    ) {
+      console.log(
+        '<base64>',
+      );
+    } else {
+      console.log(
+        recording.response.body,
+      );
+    }
+  }
+
+  console.log('');
+  console.log(
+    `Total: ${files.length}`,
+  );
+}
+
+/*
+ * ============================================================
+ * WS SEND
+ * ============================================================
+ */
 
 async function sendWsCommand(
-  id: string
+  id: string,
 ) {
-  const url =
-    `http://127.0.0.1:${PORT}` +
-    `/__mock/ws/send/` +
-    encodeURIComponent(
-      id
-    );
+  const url =
+    `http://127.0.0.1:${PORT}` +
+    `/__mock/ws/send/` +
+    encodeURIComponent(id);
 
-  try {
-    const response =
-      await fetch(
-        url,
-        {
-          method: 'POST',
-        }
-      );
+  try {
+    const response =
+      await fetch(
+        url,
+        {
+          method: 'POST',
+        },
+      );
 
-    const body =
-      await response.text();
+    const body =
+      await response.text();
 
-    console.log(body);
+    console.log(body);
 
-    if (
-      !response.ok
-    ) {
-      process.exit(1);
-    }
-  } catch (error) {
-    console.error(
-      'Cannot connect to replay proxy.'
-    );
+    if (!response.ok) {
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error(
+      'Cannot connect to replay proxy.',
+    );
 
-    console.error(
-      String(error)
-    );
+    console.error(
+      String(error),
+    );
 
-    process.exit(1);
-  }
+    process.exit(1);
+  }
 }
 
 /*
- * ============================================================
- * CLI COMMANDS
- * ============================================================
- */
+ * ============================================================
+ * CLI
+ * ============================================================
+ */
 
-if (
-  command === 'ws:list'
-) {
-  printWsList();
-
-  process.exit(0);
+if (command === 'ws:list') {
+  printWsList();
+  process.exit(0);
 }
 
-if (
-  command === 'ws:send'
-) {
-  const id =
-    process.argv[3];
+if (command === 'rest:list') {
+  printRestList();
+  process.exit(0);
+}
 
-  if (!id) {
-    console.error(
-      'Usage: npm run ws:send -- <id>'
-    );
+if (command === 'ws:send') {
+  const id = process.argv[3];
 
-    process.exit(1);
-  }
+  if (!id) {
+    console.error(
+      'Usage: npm run ws:send -- <id>',
+    );
 
-  await sendWsCommand(
-    id
-  );
+    process.exit(1);
+  }
 
-  process.exit(0);
+  await sendWsCommand(id);
+
+  process.exit(0);
 }
 
 /*
- * ============================================================
- * HTTP SERVER
- * ============================================================
- */
+ * ============================================================
+ * HTTP SERVER
+ * ============================================================
+ */
 
 const server =
-  http.createServer(
-    async (
-      req,
-      res
-    ) => {
-      try {
-        /*
-         * ------------------------------------------------------
-         * Health
-         * ------------------------------------------------------
-         */
+  http.createServer(
+    async (
+      req,
+      res,
+    ) => {
+      try {
+        /*
+         * Health
+         */
 
-        if (
-          req.method === 'GET' &&
-          req.url ===
-            '/__mock/health'
-        ) {
-          sendJson(
-            res,
-            200,
-            {
-              mode,
+        if (
+          req.method === 'GET' &&
+          req.url ===
+            '/__mock/health'
+        ) {
+          sendJson(
+            res,
+            200,
+            {
+              mode,
 
-              target:
-                TARGET,
+              target:
+                TARGET,
 
-              wsClients:
-                replayClients.size,
-            }
-          );
+              wsClients:
+                replayClients.size,
+            },
+          );
 
-          return;
-        }
+          return;
+        }
 
-        /*
-         * ------------------------------------------------------
-         * WS recordings API
-         * ------------------------------------------------------
-         */
+        /*
+         * WS list API
+         */
 
-        if (
-          req.method === 'GET' &&
-          req.url ===
-            '/__mock/ws'
-        ) {
-          sendJson(
-            res,
-            200,
-            getWsRecordings()
-          );
+        if (
+          req.method === 'GET' &&
+          req.url ===
+            '/__mock/ws'
+        ) {
+          sendJson(
+            res,
+            200,
+            getWsRecordings(),
+          );
 
-          return;
-        }
+          return;
+        }
 
-        /*
-         * ------------------------------------------------------
-         * Send WS recording
-         * ------------------------------------------------------
-         */
+        /*
+         * WS send API
+         */
 
-        const sendMatch =
-          req.url?.match(
-            /^\/__mock\/ws\/send\/(.+)$/
-          );
+        const sendMatch =
+          req.url?.match(
+            /^\/__mock\/ws\/send\/(.+)$/,
+          );
 
-        if (
-          req.method === 'POST' &&
-          sendMatch
-        ) {
-          const id =
-            decodeURIComponent(
-              sendMatch[1]
-            );
+        if (
+          req.method === 'POST' &&
+          sendMatch
+        ) {
+          const id =
+            decodeURIComponent(
+              sendMatch[1],
+            );
 
-          const filename =
-            path.join(
-              wsDir,
-              `${id}.json`
-            );
+          const filename =
+            path.join(
+              wsDir,
+              `${id}.json`,
+            );
 
-          if (
-            !fs.existsSync(
-              filename
-            )
-          ) {
-            sendJson(
-              res,
-              404,
-              {
-                error:
-                  'WS recording not found',
+          if (
+            !fs.existsSync(
+              filename,
+            )
+          ) {
+            sendJson(
+              res,
+              404,
+              {
+                error:
+                  'WS recording not found',
 
-                id,
-              }
-            );
+                id,
+              },
+            );
 
-            return;
-          }
+            return;
+          }
 
-          const recording:
-            WsRecording =
-            JSON.parse(
-              fs.readFileSync(
-                filename,
-                'utf8'
-              )
-            );
+          const recording:
+            WsRecording =
+            JSON.parse(
+              fs.readFileSync(
+                filename,
+                'utf8',
+              ),
+            );
 
-          const data =
-            Buffer.from(
-              recording.data,
-              'base64'
-            );
+          const encoding =
+            recording.dataEncoding ??
+            (
+              recording.binary
+                ? 'base64'
+                : 'utf8'
+            );
 
-          let sent = 0;
+          const data =
+            Buffer.from(
+              recording.data,
+              encoding,
+            );
 
-          for (
-            const client
-            of replayClients
-          ) {
-            if (
-              client.readyState !==
-              WebSocket.OPEN
-            ) {
-              continue;
-            }
+          let sent = 0;
 
-            client.send(
-              data,
-              {
-                binary:
-                  recording.binary,
-              }
-            );
+          for (
+            const client
+            of replayClients
+          ) {
+            if (
+              client.readyState !==
+              WebSocket.OPEN
+            ) {
+              continue;
+            }
 
-            sent++;
-          }
+            client.send(
+              data,
+              {
+                binary:
+                  recording.binary,
+              },
+            );
 
-          console.log(
-            `[WS SEND] ${id} → ${sent} client(s)`
-          );
+            sent++;
+          }
 
-          sendJson(
-            res,
-            200,
-            {
-              ok: true,
+          console.log(
+            `[WS SEND] ${id} → ${sent} client(s)`,
+          );
 
-              id,
+          sendJson(
+            res,
+            200,
+            {
+              ok: true,
+              id,
+              sent,
+            },
+          );
 
-              sent,
-            }
-          );
+          return;
+        }
 
-          return;
-        }
+        /*
+         * REST
+         */
 
-        /*
-         * ------------------------------------------------------
-         * REST
-         * ------------------------------------------------------
-         */
+        if (mode === 'record') {
+          await recordHttp(
+            req,
+            res,
+          );
+        } else {
+          await replayHttp(
+            req,
+            res,
+          );
+        }
+      } catch (error) {
+        console.error(
+          '[SERVER ERROR]',
+          error,
+        );
 
-        if (
-          mode === 'record'
-        ) {
-          await recordHttp(
-            req,
-            res
-          );
-        } else {
-          await replayHttp(
-            req,
-            res
-          );
-        }
-      } catch (
-        error
-      ) {
-        console.error(
-          '[SERVER ERROR]',
-          error
-        );
-
-        if (
-          !res.headersSent
-        ) {
-          sendJson(
-            res,
-            500,
-            {
-              error:
-                String(error),
-            }
-          );
-        }
-      }
-    }
-  );
+        if (!res.headersSent) {
+          sendJson(
+            res,
+            500,
+            {
+              error:
+                String(error),
+            },
+          );
+        }
+      }
+    },
+  );
 
 /*
- * ============================================================
- * WEBSOCKET UPGRADE
- * ============================================================
- */
+ * ============================================================
+ * WEBSOCKET UPGRADE
+ * ============================================================
+ */
 
 server.on(
-  'upgrade',
-  (
-    req,
-    socket,
-    head
-  ) => {
-    /*
-     * Admin endpoints не являются WebSocket.
-     */
+  'upgrade',
+  (
+    req,
+    socket,
+    head,
+  ) => {
+    /*
+     * Admin HTTP API не является WS.
+     */
 
-    if (
-      req.url?.startsWith(
-        '/__mock/'
-      )
-    ) {
-      socket.destroy();
+    if (
+      req.url?.startsWith(
+        '/__mock/',
+      )
+    ) {
+      socket.destroy();
 
-      return;
-    }
+      return;
+    }
 
-    /*
-     * ----------------------------------------------------------
-     * RECORD
-     * ----------------------------------------------------------
-     *
-     * Browser
-     *   ↓
-     * proxy
-     *   ↓
-     * real stand
-     */
+    /*
+     * RECORD
+     */
 
-    if (
-      mode === 'record'
-    ) {
-      const wss =
-        new WebSocketServer({
-          noServer: true,
-        });
+    if (mode === 'record') {
+      recordWss.handleUpgrade(
+        req,
+        socket,
+        head,
+        ws => {
+          recordWss.emit(
+            'connection',
+            ws,
+            req,
+          );
+        },
+      );
 
-      wss.handleUpgrade(
-        req,
-        socket,
-        head,
-        browserWs => {
-          recordWebSocket(
-            req,
-            browserWs
-          );
-        }
-      );
+      return;
+    }
 
-      return;
-    }
+    /*
+     * REPLAY
+     */
 
-    /*
-     * ----------------------------------------------------------
-     * REPLAY
-     * ----------------------------------------------------------
-     *
-     * Browser
-     *   ↓
-     * replay proxy
-     *
-     * Никакого подключения
-     * к реальному стенду.
-     */
-
-    replayWss.handleUpgrade(
-      req,
-      socket,
-      head,
-      ws => {
-        replayWss.emit(
-          'connection',
-          ws,
-          req
-        );
-      }
-    );
-  }
+    replayWss.handleUpgrade(
+      req,
+      socket,
+      head,
+      ws => {
+        replayWss.emit(
+          'connection',
+          ws,
+          req,
+        );
+      },
+    );
+  },
 );
 
 /*
- * ============================================================
- * START
- * ============================================================
- */
+ * ============================================================
+ * START
+ * ============================================================
+ */
 
 server.listen(
-  PORT,
-  () => {
-    console.log('');
-    console.log(
-      '========================================'
-    );
+  PORT,
+  () => {
+    console.log('');
 
-    console.log(
-      ' REST / WebSocket Record Replay Proxy'
-    );
+    console.log(
+      '========================================',
+    );
 
-    console.log(
-      '========================================'
-    );
+    console.log(
+      ' REST / WebSocket Record Replay Proxy',
+    );
 
-    console.log(
-      `Mode:   ${mode}`
-    );
+    console.log(
+      '========================================',
+    );
 
-    console.log(
-      `Target: ${TARGET}`
-    );
+    console.log(
+      `Mode:   ${mode}`,
+    );
 
-    console.log(
-      `Port:   ${PORT}`
-    );
+    console.log(
+      `Target: ${TARGET}`,
+    );
 
-    console.log(
-      `HTTP:   ${httpDir}`
-    );
+    console.log(
+      `Port:   ${PORT}`,
+    );
 
-    console.log(
-      `WS:     ${wsDir}`
-    );
+    console.log(
+      `HTTP:   ${httpDir}`,
+    );
 
-    console.log(
-      '========================================'
-    );
+    console.log(
+      `WS:     ${wsDir}`,
+    );
 
-    console.log('');
-  }
+    console.log(
+      '========================================',
+    );
+
+    console.log('');
+  },
 );
+
+
+
