@@ -280,7 +280,7 @@ function makeRequestKey(
 
 function readBody(
   req: http.IncomingMessage,
-) {
+): Promise<Buffer> {
   return new Promise(
     (resolve, reject) => {
       const chunks: Buffer[] = [];

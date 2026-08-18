@@ -16,11 +16,13 @@
   "dependencies": {
     "http-proxy": "^1.18.1",
     "picomatch": "^4.0.2",
+    "typescript": "^7.0.2",
     "ws": "^8.18.3"
   },
   "devDependencies": {
     "@types/http-proxy": "^1.17.16",
     "@types/node": "^24.0.0",
+    "@types/picomatch": "^4.0.3",
     "@types/ws": "^8.18.1"
   }
 }

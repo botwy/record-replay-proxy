@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "node20",
+    "outDir": "./dist",
+    "rootDir": "./",
+    "strict": true
+  },
+  "include": ["./**/*.ts"],
+  "exclude": ["./node_modules", "./test.ts"]
+}
